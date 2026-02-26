@@ -1,0 +1,251 @@
+package entdomain
+
+import (
+	"bytes"
+	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+	"strings"
+	"text/template"
+
+	"entgo.io/ent/entc"
+	"entgo.io/ent/entc/gen"
+	"golang.org/x/tools/imports"
+)
+
+// Extension is the entdomain Ent extension.
+type Extension struct {
+	// Config holds the extension configuration.
+	Config *ExtensionConfig
+}
+
+// ExtensionConfig holds configuration for the extension
+type ExtensionConfig struct {
+	// GenerateBaseService controls whether BaseService structs are generated
+	GenerateBaseService bool
+
+	// GenerateBaseHandler controls whether BaseHandler structs are generated
+	GenerateBaseHandler bool
+
+	// EntDomainPackage is the import path for the entdomain package
+	// Default: "github.com/githonllc/entdomain"
+	EntDomainPackage string
+}
+
+const defaultEntDomainPackage = "github.com/githonllc/entdomain"
+
+// NewExtension creates a new extension instance
+func NewExtension(config *ExtensionConfig) *Extension {
+	if config == nil {
+		config = &ExtensionConfig{}
+	}
+	if config.EntDomainPackage == "" {
+		config.EntDomainPackage = defaultEntDomainPackage
+	}
+
+	return &Extension{
+		Config: config,
+	}
+}
+
+// Hooks returns the extension's hooks — uses a Hook to generate separate files per Type.
+func (e *Extension) Hooks() []gen.Hook {
+	return []gen.Hook{
+		e.generatePerTypeFiles, // main generation logic
+	}
+}
+
+// Templates returns an empty template list — the old GraphTemplate approach is no longer used.
+func (e *Extension) Templates() []*gen.Template {
+	return []*gen.Template{} // removed legacy GraphTemplate generation
+}
+
+// generatePerTypeFiles is the core Hook that generates separate files for each Type.
+func (e *Extension) generatePerTypeFiles(next gen.Generator) gen.Generator {
+	return gen.GenerateFunc(func(g *gen.Graph) error {
+		// Run the standard generation first
+		if err := next.Generate(g); err != nil {
+			return err
+		}
+
+		// Generate separate files for each Type that has entdomain annotations.
+		// Entities without annotations are skipped to avoid empty generated files.
+		for _, node := range g.Nodes {
+			if len(domainFields(node)) == 0 {
+				continue
+			}
+
+			// Generate DTO file → ent/{entity}_dto.go
+			if err := e.generateDTOFile(g, node); err != nil {
+				return fmt.Errorf("failed to generate %s DTO: %w", node.Name, err)
+			}
+
+			// Generate base service file → ent/{entity}_base_service.go
+			if e.Config.GenerateBaseService {
+				if err := e.generateBaseServiceFile(g, node); err != nil {
+					return fmt.Errorf("failed to generate %s base service file: %w", node.Name, err)
+				}
+			}
+
+			// Generate base handler file → ent/{entity}_base_handler.go
+			if e.Config.GenerateBaseHandler {
+				if err := e.generateBaseHandlerFile(g, node); err != nil {
+					return fmt.Errorf("failed to generate %s base handler file: %w", node.Name, err)
+				}
+			}
+		}
+
+		return nil
+	})
+}
+
+// generateDTOFile generates a DTO file for a single Type.
+// Output: ent/{entity}_dto.go
+func (e *Extension) generateDTOFile(g *gen.Graph, node *gen.Type) error {
+	tmpl, err := template.New("dto").
+		Funcs(e.templateFuncMap()).
+		Parse(dtoTemplate)
+	if err != nil {
+		return fmt.Errorf("failed to parse DTO template: %w", err)
+	}
+
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, node); err != nil {
+		return fmt.Errorf("failed to render DTO template: %w", err)
+	}
+
+	filename := fmt.Sprintf("%s_dto.go", strings.ToLower(node.Name))
+	outputPath := filepath.Join(g.Config.Target, filename)
+
+	return writeFile(outputPath, buf.Bytes())
+}
+
+// generateBaseServiceFile generates a base service file for a single Type.
+// Output: ent/{entity}_base_service.go
+func (e *Extension) generateBaseServiceFile(g *gen.Graph, node *gen.Type) error {
+	tmpl, err := template.New("base_service").
+		Funcs(e.templateFuncMap()).
+		Parse(baseServiceTemplate)
+	if err != nil {
+		return fmt.Errorf("failed to parse base service template: %w", err)
+	}
+
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, node); err != nil {
+		return fmt.Errorf("failed to render base service template: %w", err)
+	}
+
+	filename := fmt.Sprintf("%s_base_service.go", strings.ToLower(node.Name))
+	outputPath := filepath.Join(g.Config.Target, filename)
+
+	return writeFile(outputPath, buf.Bytes())
+}
+
+// generateBaseHandlerFile generates a base handler file for a single Type.
+// Output: ent/{entity}_base_handler.go
+func (e *Extension) generateBaseHandlerFile(g *gen.Graph, node *gen.Type) error {
+	tmpl, err := template.New("base_handler").
+		Funcs(e.templateFuncMap()).
+		Parse(baseHandlerTemplate)
+	if err != nil {
+		return fmt.Errorf("failed to parse base handler template: %w", err)
+	}
+
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, node); err != nil {
+		return fmt.Errorf("failed to render base handler template: %w", err)
+	}
+
+	filename := fmt.Sprintf("%s_base_handler.go", strings.ToLower(node.Name))
+	outputPath := filepath.Join(g.Config.Target, filename)
+
+	return writeFile(outputPath, buf.Bytes())
+}
+
+// writeFile formats the generated Go source with goimports and writes it to disk
+func writeFile(path string, content []byte) error {
+	formatted, err := imports.Process(path, content, nil)
+	if err != nil {
+		log.Printf("WARNING: goimports formatting failed for %s: %v (writing unformatted)", path, err)
+		formatted = content
+	}
+	if err := os.WriteFile(path, formatted, 0644); err != nil {
+		return fmt.Errorf("failed to write file %s: %w", path, err)
+	}
+	return nil
+}
+
+// templateFuncMap returns the combined template function map with Ent standard functions
+func (e *Extension) templateFuncMap() template.FuncMap {
+	funcs := make(template.FuncMap, len(gen.Funcs))
+	for k, v := range gen.Funcs {
+		funcs[k] = v
+	}
+
+	for k, v := range templateFuncs() {
+		funcs[k] = v
+	}
+
+	pkg := e.Config.EntDomainPackage
+	funcs["entdomainPkg"] = func() string { return pkg }
+
+	return funcs
+}
+
+// Option is a function type for configuring the extension.
+type Option func(*ExtensionConfig)
+
+// WithBaseService controls whether BaseService structs are generated
+func WithBaseService(generate bool) Option {
+	return func(c *ExtensionConfig) {
+		c.GenerateBaseService = generate
+	}
+}
+
+// WithBaseHandler controls whether BaseHandler structs are generated
+func WithBaseHandler(generate bool) Option {
+	return func(c *ExtensionConfig) {
+		c.GenerateBaseHandler = generate
+	}
+}
+
+// WithEntDomainPackage sets the import path for the entdomain package
+func WithEntDomainPackage(pkg string) Option {
+	return func(c *ExtensionConfig) {
+		c.EntDomainPackage = pkg
+	}
+}
+
+// NewExtensionWithOptions creates a new extension using functional options.
+func NewExtensionWithOptions(opts ...Option) *Extension {
+	config := &ExtensionConfig{}
+
+	for _, opt := range opts {
+		opt(config)
+	}
+
+	return NewExtension(config)
+}
+
+// Annotations returns global annotations for the extension
+func (e *Extension) Annotations() []entc.Annotation {
+	return []entc.Annotation{
+		&ConfigAnnotation{Config: e.Config},
+	}
+}
+
+// Options returns the extension options
+func (e *Extension) Options() []entc.Option {
+	return []entc.Option{}
+}
+
+// ConfigAnnotation implements entc.Annotation for extension configuration
+type ConfigAnnotation struct {
+	Config *ExtensionConfig
+}
+
+// Name returns the annotation name.
+func (ConfigAnnotation) Name() string {
+	return "ExtensionConfig"
+}
